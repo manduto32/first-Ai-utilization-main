@@ -1,0 +1,5 @@
+root_id,cell_type,soma_side,model_role,role_basis,metadata_source,behavior_status
+10059,DNp20,right,steering,user_specified,neurons.csv,unverified
+10162,DNp20,left,steering,user_specified,neurons.csv,unverified
+10527,DNpe017,left,forward,user_specified,neurons.csv,unverified
+555871,DNpe017,right,forward,user_specified,neurons.csv,unverified
