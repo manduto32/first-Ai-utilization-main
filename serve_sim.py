@@ -6,15 +6,21 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, urlsplit
+
+from PIL import Image
+
+from point_sim import FlyExperiment, create_walkable_mask
 
 
 ROOT = Path(__file__).resolve().parent
 HOST = "127.0.0.1"
 PORT = 8080
 PAGE = "point_simulation.html"
+IMAGE_PATH = ROOT / "지도.png"
 CONNECTIONS_PATH = ROOT / "file_csv" / "connections_princeton.csv"
 NEURONS_PATH = ROOT / "file_csv" / "neurons.csv"
 ROLE_ASSIGNMENTS_PATH = ROOT / "file_csv" / "neuron_role_assignments.csv"
@@ -145,25 +151,74 @@ def load_circuit_data() -> dict[str, object]:
     }
 
 
-def make_request_handler(circuit_data: dict[str, object]) -> type[SimpleHTTPRequestHandler]:
-    class CircuitRequestHandler(SimpleHTTPRequestHandler):
+def make_request_handler(experiment: FlyExperiment) -> type[SimpleHTTPRequestHandler]:
+    experiment_lock = threading.Lock()
+
+    class SimulationRequestHandler(SimpleHTTPRequestHandler):
         def __init__(self, *args: object, **kwargs: object) -> None:
             super().__init__(*args, directory=str(ROOT), **kwargs)
 
         def do_GET(self) -> None:
-            if urlsplit(self.path).path != "/api/circuit":
+            if urlsplit(self.path).path != "/api/state":
                 super().do_GET()
                 return
+            with experiment_lock:
+                self._send_json(200, experiment.public_state())
 
-            payload = json.dumps(circuit_data, separators=(",", ":")).encode("utf-8")
-            self.send_response(200)
+        def do_POST(self) -> None:
+            route = urlsplit(self.path).path
+            try:
+                payload = self._read_json() if route == "/api/point" else {}
+                with experiment_lock:
+                    include_path = True
+                    if route == "/api/point":
+                        experiment.select_point(payload.get("x"), payload.get("y"))
+                    elif route == "/api/train":
+                        experiment.train()
+                    elif route == "/api/run":
+                        experiment.start_run()
+                    elif route == "/api/step":
+                        experiment.step()
+                        include_path = False
+                    elif route == "/api/reset-learning":
+                        experiment.reset_learning()
+                    elif route == "/api/reset-points":
+                        experiment.reset_points()
+                    else:
+                        self._send_json(404, {"error": "알 수 없는 API 경로입니다."})
+                        return
+                    self._send_json(
+                        200,
+                        experiment.public_state(include_path=include_path),
+                    )
+            except ValueError as error:
+                self._send_json(400, {"error": str(error)})
+
+        def _read_json(self) -> dict[str, object]:
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+            except ValueError as error:
+                raise ValueError("요청 본문 크기가 올바르지 않습니다.") from error
+            if content_length <= 0 or content_length > 4096:
+                raise ValueError("요청 본문이 없거나 너무 큽니다.")
+            try:
+                payload = json.loads(self.rfile.read(content_length))
+            except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                raise ValueError("요청 JSON 형식이 올바르지 않습니다.") from error
+            if not isinstance(payload, dict):
+                raise ValueError("요청 본문은 JSON 객체여야 합니다.")
+            return payload
+
+        def _send_json(self, status: int, payload: dict[str, object]) -> None:
+            body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            self.wfile.write(payload)
+            self.wfile.write(body)
 
-    return CircuitRequestHandler
+    return SimulationRequestHandler
 
 
 def find_chrome() -> str | None:
@@ -191,14 +246,23 @@ def main() -> int:
 
     try:
         circuit_data = load_circuit_data()
+        with Image.open(IMAGE_PATH) as source:
+            image = source.convert("RGB")
+        mask_width, mask_height, walkable_bits = create_walkable_mask(image)
+        experiment = FlyExperiment(
+            image.size,
+            (mask_width, mask_height),
+            walkable_bits,
+            circuit_data,
+        )
     except (OSError, csv.Error, ValueError) as error:
-        print(f"연결 데이터를 준비하지 못했습니다: {error}", file=sys.stderr)
+        print(f"시뮬레이션 데이터를 준비하지 못했습니다: {error}", file=sys.stderr)
         return 1
 
     url = f"http://{HOST}:{PORT}/{quote(PAGE)}"
     try:
         server = ThreadingHTTPServer(
-            (HOST, PORT), make_request_handler(circuit_data)
+            (HOST, PORT), make_request_handler(experiment)
         )
     except OSError as error:
         print(
@@ -210,7 +274,8 @@ def main() -> int:
 
     stats = circuit_data["stats"]
     print(
-        f"회로 연결 로드 완료: {stats['aggregated_edges']}개 연결, "
+        f"Python 시뮬레이션 준비 완료: 통로 {mask_width}x{mask_height}, "
+        f"회로 연결 {stats['aggregated_edges']}개, "
         f"시냅스 {stats['total_synapses']:,}개"
     )
     print(f"Chrome에서 가상 초파리 실험을 엽니다: {url}")
